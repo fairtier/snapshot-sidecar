@@ -1,0 +1,12 @@
+version: v2
+plugins:
+  # Go protobuf messages
+  - local: protoc-gen-go
+    out: proto
+    opt:
+      - module=github.com/fairtier/snapshot-sidecar/proto
+  # Go ConnectRPC service stubs
+  - local: protoc-gen-connect-go
+    out: proto
+    opt:
+      - module=github.com/fairtier/snapshot-sidecar/proto

@@ -1,0 +1,32 @@
+syntax = "proto3";
+
+package snapshot.v1;
+
+option go_package = "github.com/fairtier/snapshot-sidecar/proto/snapshot/v1;snapshotv1";
+
+// SnapshotService manages project directory snapshots to S3.
+service SnapshotService {
+  rpc TriggerSnapshot(TriggerSnapshotRequest) returns (TriggerSnapshotResponse) {}
+  rpc ListSnapshots(ListSnapshotsRequest) returns (ListSnapshotsResponse) {}
+}
+
+message TriggerSnapshotRequest {}
+
+message TriggerSnapshotResponse {
+  // "created", "unchanged", or "busy"
+  string status = 1;
+  string key = 2;
+  string hash = 3;
+}
+
+message ListSnapshotsRequest {}
+
+message ListSnapshotsResponse {
+  repeated Snapshot snapshots = 1;
+}
+
+message Snapshot {
+  string key = 1;
+  string hash = 2;
+  string timestamp = 3;
+}

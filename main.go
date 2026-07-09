@@ -1,47 +1,51 @@
-// snapshot-sidecar is a generic sidecar binary for snapshotting project directories to S3.
+// snapshot-sidecar is a generic sidecar binary for persisting project
+// directories, with two interchangeable backends:
+//
+//   - s3 (default): tar.gz snapshots to S3-compatible storage with SHA-256
+//     deduplication and a latest.json marker.
+//   - git: the project directory is a working clone of a remote; save =
+//     commit + plain push, sync = fast-forward pull. Never force, never
+//     auto-merge — see git.go.
 //
 // Subcommands:
 //   - serve: Run ConnectRPC sidecar (SnapshotService + gRPC health)
 //     with SIGTERM-triggered save and optional periodic auto-save.
-//   - restore: Download the latest snapshot from S3 and extract it.
-//     Exits 0 even if no snapshot exists (first boot).
+//   - restore: Populate the project directory (download latest S3 snapshot,
+//     or clone/adopt the git remote). Exits 0 on first boot with nothing to
+//     restore.
 package main
 
 import (
-	"archive/tar"
-	"bytes"
-	"compress/gzip"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"io/fs"
 	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
-	"path/filepath"
 	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
-	"connectrpc.com/connect"
 	"connectrpc.com/grpchealth"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	awsconfig "github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
-	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"golang.org/x/net/http2"
-	"golang.org/x/net/http2/h2c"
 
 	snapshotv1 "github.com/fairtier/snapshot-sidecar/proto/snapshot/v1"
 	"github.com/fairtier/snapshot-sidecar/proto/snapshot/v1/snapshotv1connect"
 )
+
+const (
+	backendS3  = "s3"
+	backendGit = "git"
+)
+
+// backend is what serve/restore run against — the RPC surface plus the save
+// primitive shared by the autosave loop and the SIGTERM handler.
+type backend interface {
+	snapshotv1connect.SnapshotServiceHandler
+	save(ctx context.Context) (*snapshotv1.TriggerSnapshotResponse, error)
+}
 
 func shortHash(h string) string {
 	if len(h) < 12 {
@@ -103,24 +107,55 @@ func printVersion() {
 
 // envConfig reads configuration from environment variables.
 type envConfig struct {
+	Backend          string        // SNAPSHOT_BACKEND (s3|git, default: s3)
 	ProjectDir       string        // SNAPSHOT_PROJECT_DIR (default: /project)
-	S3Bucket         string        // S3_BUCKET (required)
-	SnapshotPrefix   string        // SNAPSHOT_PREFIX (default: snapshots)
 	AutosaveInterval time.Duration // AUTOSAVE_INTERVAL (default: 0 = disabled)
 	ListenAddr       string        // LISTEN_ADDR (default: :8484)
-	ExcludeDirs      []string      // SNAPSHOT_EXCLUDE_DIRS (comma-separated, default: empty)
+
+	// s3 backend
+	S3Bucket       string   // S3_BUCKET (required for s3)
+	SnapshotPrefix string   // SNAPSHOT_PREFIX (default: snapshots)
+	ExcludeDirs    []string // SNAPSHOT_EXCLUDE_DIRS (comma-separated, default: empty)
+
+	// git backend
+	GitRemoteURL   string        // GIT_REMOTE_URL (required for git)
+	GitBranch      string        // GIT_BRANCH (default: main)
+	GitUsername    string        // GIT_USERNAME (default: git — token is what matters)
+	GitToken       string        // GIT_TOKEN (required for git)
+	GitAuthorName  string        // GIT_AUTHOR_NAME (default: FairTier Autosave)
+	GitAuthorEmail string        // GIT_AUTHOR_EMAIL (default: snapshot-sidecar@fairtier.com)
+	SyncInterval   time.Duration // SYNC_INTERVAL (git only, default: 0 = disabled)
 }
 
 func loadConfig() (envConfig, error) {
 	c := envConfig{
+		Backend:        envOr("SNAPSHOT_BACKEND", backendS3),
 		ProjectDir:     envOr("SNAPSHOT_PROJECT_DIR", "/project"),
 		S3Bucket:       os.Getenv("S3_BUCKET"),
 		SnapshotPrefix: envOr("SNAPSHOT_PREFIX", "snapshots"),
 		ListenAddr:     envOr("LISTEN_ADDR", ":8484"),
+		GitRemoteURL:   os.Getenv("GIT_REMOTE_URL"),
+		GitBranch:      envOr("GIT_BRANCH", "main"),
+		GitUsername:    os.Getenv("GIT_USERNAME"),
+		GitToken:       os.Getenv("GIT_TOKEN"),
+		GitAuthorName:  envOr("GIT_AUTHOR_NAME", "FairTier Autosave"),
+		GitAuthorEmail: envOr("GIT_AUTHOR_EMAIL", "snapshot-sidecar@fairtier.com"),
 	}
 
-	if c.S3Bucket == "" {
-		return c, fmt.Errorf("S3_BUCKET environment variable is required")
+	switch c.Backend {
+	case backendS3:
+		if c.S3Bucket == "" {
+			return c, fmt.Errorf("S3_BUCKET environment variable is required")
+		}
+	case backendGit:
+		if c.GitRemoteURL == "" {
+			return c, fmt.Errorf("GIT_REMOTE_URL environment variable is required")
+		}
+		if c.GitToken == "" {
+			return c, fmt.Errorf("GIT_TOKEN environment variable is required")
+		}
+	default:
+		return c, fmt.Errorf("invalid SNAPSHOT_BACKEND %q (want s3 or git)", c.Backend)
 	}
 
 	if v := os.Getenv("SNAPSHOT_EXCLUDE_DIRS"); v != "" {
@@ -132,15 +167,27 @@ func loadConfig() (envConfig, error) {
 		}
 	}
 
-	if v := os.Getenv("AUTOSAVE_INTERVAL"); v != "" && v != "0" {
-		d, err := time.ParseDuration(v)
-		if err != nil {
-			return c, fmt.Errorf("invalid AUTOSAVE_INTERVAL %q: %w", v, err)
-		}
-		c.AutosaveInterval = d
+	var err error
+	if c.AutosaveInterval, err = durationEnv("AUTOSAVE_INTERVAL"); err != nil {
+		return c, err
+	}
+	if c.SyncInterval, err = durationEnv("SYNC_INTERVAL"); err != nil {
+		return c, err
 	}
 
 	return c, nil
+}
+
+func durationEnv(key string) (time.Duration, error) {
+	v := os.Getenv(key)
+	if v == "" || v == "0" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(v)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s %q: %w", key, v, err)
+	}
+	return d, nil
 }
 
 func envOr(key, fallback string) string {
@@ -150,10 +197,13 @@ func envOr(key, fallback string) string {
 	return fallback
 }
 
-// latestMarker is stored as latest.json in S3 to track the current snapshot.
-type latestMarker struct {
-	Key  string `json:"key"`
-	Hash string `json:"hash"`
+func newBackend(ctx context.Context, logger *slog.Logger, cfg envConfig) (backend, error) {
+	switch cfg.Backend {
+	case backendGit:
+		return newGitBackend(ctx, logger, cfg)
+	default:
+		return newSnapshotter(ctx, logger, cfg)
+	}
 }
 
 // ── serve ────────────────────────────────────────────────────────────────────
@@ -164,37 +214,32 @@ func runServe(logger *slog.Logger) error {
 		return err
 	}
 
-	s3Client, err := newS3Client(context.Background())
-	if err != nil {
-		return fmt.Errorf("create S3 client: %w", err)
-	}
-
-	snap := &snapshotter{
-		logger: logger,
-		s3:     s3Client,
-		cfg:    cfg,
-	}
-
-	// Load the current latest hash so we can deduplicate.
-	if latest, err := snap.getLatestMarker(context.Background()); err != nil {
-		logger.Warn("no existing snapshot marker", "err", err)
-	} else {
-		snap.lastHash = latest.Hash
-		logger.Info("loaded latest snapshot hash", "hash", shortHash(latest.Hash))
-	}
-
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	b, err := newBackend(ctx, logger, cfg)
+	if err != nil {
+		return err
+	}
+
 	mux := http.NewServeMux()
-	mux.Handle(snapshotv1connect.NewSnapshotServiceHandler(snap))
+	mux.Handle(snapshotv1connect.NewSnapshotServiceHandler(b))
 	mux.Handle(grpchealth.NewHandler(grpchealth.NewStaticChecker(
 		snapshotv1connect.SnapshotServiceName,
 	)))
+	if d, ok := b.(interface{ registerDebug(*http.ServeMux) }); ok {
+		d.registerDebug(mux)
+	}
+
+	// h2c: gRPC/Connect clients speak HTTP/2 without TLS in-cluster.
+	var protocols http.Protocols
+	protocols.SetHTTP1(true)
+	protocols.SetUnencryptedHTTP2(true)
 
 	srv := &http.Server{
 		Addr:              cfg.ListenAddr,
-		Handler:           h2c.NewHandler(mux, &http2.Server{}),
+		Handler:           mux,
+		Protocols:         &protocols,
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      60 * time.Second,
@@ -202,19 +247,31 @@ func runServe(logger *slog.Logger) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		logger.Info("sidecar listening", "addr", cfg.ListenAddr)
+		logger.Info("sidecar listening", "addr", cfg.ListenAddr, "backend", cfg.Backend)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
 	}()
 
-	// Optional periodic auto-save.
 	var wg sync.WaitGroup
+
+	// Optional periodic auto-save.
 	if cfg.AutosaveInterval > 0 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			snap.autosaveLoop(ctx, cfg.AutosaveInterval)
+			autosaveLoop(ctx, logger, b, cfg.AutosaveInterval)
+		}()
+	}
+
+	// Optional periodic remote sync (git backend only).
+	if s, ok := b.(interface {
+		syncLoop(context.Context, time.Duration)
+	}); ok && cfg.SyncInterval > 0 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.syncLoop(ctx, cfg.SyncInterval)
 		}()
 	}
 
@@ -226,17 +283,17 @@ func runServe(logger *slog.Logger) error {
 		return fmt.Errorf("server error: %w", err)
 	}
 
-	// Wait for autosave loop to finish before creating the final snapshot.
+	// Wait for background loops to finish before creating the final snapshot.
 	wg.Wait()
 
 	// SIGTERM snapshot — use a fresh context with a deadline.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer shutdownCancel()
 
-	if _, err := snap.createSnapshot(shutdownCtx); err != nil {
+	if resp, err := b.save(shutdownCtx); err != nil {
 		logger.Error("shutdown snapshot failed", "err", err)
 	} else {
-		logger.Info("shutdown snapshot complete")
+		logger.Info("shutdown snapshot complete", "status", resp.GetStatus())
 	}
 
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -247,230 +304,7 @@ func runServe(logger *slog.Logger) error {
 	return nil
 }
 
-var _ snapshotv1connect.SnapshotServiceHandler = (*snapshotter)(nil)
-
-type snapshotter struct {
-	logger   *slog.Logger
-	s3       *s3.Client
-	cfg      envConfig
-	lastHash string
-	mu       sync.Mutex // protects lastHash
-	busyMu   sync.Mutex // prevents concurrent snapshots
-}
-
-func (s *snapshotter) isUnchanged(hash string) bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.lastHash == hash
-}
-
-func (s *snapshotter) setLastHash(hash string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.lastHash = hash
-}
-
-// TriggerSnapshot implements snapshotv1connect.SnapshotServiceHandler.
-func (s *snapshotter) TriggerSnapshot(
-	ctx context.Context,
-	_ *connect.Request[snapshotv1.TriggerSnapshotRequest],
-) (*connect.Response[snapshotv1.TriggerSnapshotResponse], error) {
-	result, err := s.createSnapshot(ctx)
-	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, err)
-	}
-	return connect.NewResponse(result), nil
-}
-
-// ListSnapshots implements snapshotv1connect.SnapshotServiceHandler.
-func (s *snapshotter) ListSnapshots(
-	ctx context.Context,
-	_ *connect.Request[snapshotv1.ListSnapshotsRequest],
-) (*connect.Response[snapshotv1.ListSnapshotsResponse], error) {
-	paginator := s3.NewListObjectsV2Paginator(s.s3, &s3.ListObjectsV2Input{
-		Bucket: &s.cfg.S3Bucket,
-		Prefix: new(s.cfg.SnapshotPrefix + "/"),
-	})
-
-	var snapshots []*snapshotv1.Snapshot
-	for paginator.HasMorePages() {
-		page, err := paginator.NextPage(ctx)
-		if err != nil {
-			return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("list objects: %w", err))
-		}
-		for _, obj := range page.Contents {
-			key := aws.ToString(obj.Key)
-			if !strings.HasSuffix(key, ".tar.gz") {
-				continue
-			}
-			// Parse hash from key: {prefix}/{timestamp}-{hash}.tar.gz
-			base := filepath.Base(key)
-			base = strings.TrimSuffix(base, ".tar.gz")
-			parts := strings.SplitN(base, "-", 2)
-			var hash string
-			if len(parts) == 2 {
-				hash = parts[1]
-			}
-			snapshots = append(snapshots, &snapshotv1.Snapshot{
-				Key:       key,
-				Timestamp: aws.ToTime(obj.LastModified).Format(time.RFC3339),
-				Hash:      hash,
-			})
-		}
-	}
-
-	return connect.NewResponse(&snapshotv1.ListSnapshotsResponse{
-		Snapshots: snapshots,
-	}), nil
-}
-
-func (s *snapshotter) createSnapshot(ctx context.Context) (*snapshotv1.TriggerSnapshotResponse, error) {
-	// Prevent concurrent snapshots.
-	if !s.busyMu.TryLock() {
-		return &snapshotv1.TriggerSnapshotResponse{Status: "busy"}, nil
-	}
-	defer s.busyMu.Unlock()
-
-	// Create tar.gz in memory and compute hash.
-	buf, hash, err := s.tarProjectDir()
-	if err != nil {
-		return nil, fmt.Errorf("create archive: %w", err)
-	}
-
-	// Deduplicate.
-	if s.isUnchanged(hash) {
-		s.logger.Info("snapshot unchanged, skipping upload", "hash", shortHash(hash))
-		return &snapshotv1.TriggerSnapshotResponse{Status: "unchanged", Hash: hash}, nil
-	}
-
-	// Upload snapshot.
-	now := time.Now().UTC()
-	key := fmt.Sprintf("%s/%s-%s.tar.gz",
-		s.cfg.SnapshotPrefix,
-		now.Format("20060102T150405Z"),
-		shortHash(hash),
-	)
-
-	if err := s.uploadBytes(ctx, key, buf); err != nil {
-		return nil, fmt.Errorf("upload snapshot: %w", err)
-	}
-
-	// Update latest.json marker.
-	marker := latestMarker{Key: key, Hash: hash}
-	markerJSON, err := json.Marshal(marker)
-	if err != nil {
-		return nil, fmt.Errorf("marshal latest marker: %w", err)
-	}
-	markerKey := s.cfg.SnapshotPrefix + "/latest.json"
-	if err := s.uploadBytes(ctx, markerKey, markerJSON); err != nil {
-		return nil, fmt.Errorf("upload latest marker: %w", err)
-	}
-
-	s.setLastHash(hash)
-
-	s.logger.Info("snapshot created", "key", key, "hash", shortHash(hash))
-	return &snapshotv1.TriggerSnapshotResponse{Status: "created", Key: key, Hash: hash}, nil
-}
-
-func (s *snapshotter) tarProjectDir() ([]byte, string, error) {
-	var buf bytes.Buffer
-	h := sha256.New()
-
-	// Write tar.gz to both buf and hasher.
-	mw := io.MultiWriter(&buf, h)
-	gw := gzip.NewWriter(mw)
-	tw := tar.NewWriter(gw)
-
-	err := filepath.WalkDir(s.cfg.ProjectDir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return err
-		}
-
-		rel, err := filepath.Rel(s.cfg.ProjectDir, path)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			return nil
-		}
-
-		if d.IsDir() {
-			for _, excl := range s.cfg.ExcludeDirs {
-				if rel == excl {
-					return filepath.SkipDir
-				}
-			}
-		}
-
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-
-		header, err := tar.FileInfoHeader(info, "")
-		if err != nil {
-			return err
-		}
-		header.Name = rel
-
-		if err := tw.WriteHeader(header); err != nil {
-			return err
-		}
-
-		if d.IsDir() {
-			return nil
-		}
-
-		f, err := os.Open(path)
-		if err != nil {
-			return err
-		}
-		defer func() { _ = f.Close() }()
-
-		_, err = io.Copy(tw, f)
-		return err
-	})
-	if err != nil {
-		return nil, "", err
-	}
-
-	if err := tw.Close(); err != nil {
-		return nil, "", err
-	}
-	if err := gw.Close(); err != nil {
-		return nil, "", err
-	}
-
-	return buf.Bytes(), hex.EncodeToString(h.Sum(nil)), nil
-}
-
-func (s *snapshotter) uploadBytes(ctx context.Context, key string, data []byte) error {
-	_, err := s.s3.PutObject(ctx, &s3.PutObjectInput{
-		Bucket: &s.cfg.S3Bucket,
-		Key:    &key,
-		Body:   bytes.NewReader(data),
-	})
-	return err
-}
-
-func (s *snapshotter) getLatestMarker(ctx context.Context) (*latestMarker, error) {
-	resp, err := s.s3.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: &s.cfg.S3Bucket,
-		Key:    new(s.cfg.SnapshotPrefix + "/latest.json"),
-	})
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	var m latestMarker
-	if err := json.NewDecoder(resp.Body).Decode(&m); err != nil {
-		return nil, err
-	}
-	return &m, nil
-}
-
-func (s *snapshotter) autosaveLoop(ctx context.Context, interval time.Duration) {
+func autosaveLoop(ctx context.Context, logger *slog.Logger, b backend, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
@@ -479,8 +313,10 @@ func (s *snapshotter) autosaveLoop(ctx context.Context, interval time.Duration) 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if _, err := s.createSnapshot(ctx); err != nil {
-				s.logger.Error("autosave failed", "err", err)
+			if resp, err := b.save(ctx); err != nil {
+				logger.Error("autosave failed", "err", err)
+			} else if resp.GetStatus() == "created" {
+				logger.Info("autosave", "key", resp.GetKey())
 			}
 		}
 	}
@@ -497,115 +333,10 @@ func runRestore(logger *slog.Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	s3Client, err := newS3Client(ctx)
-	if err != nil {
-		return fmt.Errorf("create S3 client: %w", err)
+	switch cfg.Backend {
+	case backendGit:
+		return restoreGit(ctx, logger, cfg)
+	default:
+		return restoreS3(ctx, logger, cfg)
 	}
-
-	// Read latest.json marker.
-	markerKey := cfg.SnapshotPrefix + "/latest.json"
-	markerResp, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: &cfg.S3Bucket,
-		Key:    &markerKey,
-	})
-	if err != nil {
-		if errors.As(err, new(*types.NoSuchKey)) || errors.As(err, new(*types.NotFound)) {
-			logger.Info("no snapshot found, starting fresh")
-			return nil
-		}
-		return fmt.Errorf("fetch latest.json: %w", err)
-	}
-	defer func() { _ = markerResp.Body.Close() }()
-
-	var marker latestMarker
-	if err := json.NewDecoder(markerResp.Body).Decode(&marker); err != nil {
-		return fmt.Errorf("decode latest.json: %w", err)
-	}
-
-	logger.Info("restoring snapshot", "key", marker.Key)
-
-	// Download the snapshot tar.gz.
-	snapResp, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
-		Bucket: &cfg.S3Bucket,
-		Key:    &marker.Key,
-	})
-	if err != nil {
-		return fmt.Errorf("download snapshot: %w", err)
-	}
-	defer func() { _ = snapResp.Body.Close() }()
-
-	// Extract to project directory.
-	if err := extractTarGz(snapResp.Body, cfg.ProjectDir); err != nil {
-		return fmt.Errorf("extract snapshot: %w", err)
-	}
-
-	logger.Info("snapshot restored", "key", marker.Key)
-	return nil
-}
-
-func extractTarGz(r io.Reader, destDir string) error {
-	gr, err := gzip.NewReader(r)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = gr.Close() }()
-
-	tr := tar.NewReader(gr)
-	for {
-		header, err := tr.Next()
-		if errors.Is(err, io.EOF) {
-			break
-		}
-		if err != nil {
-			return err
-		}
-
-		target := filepath.Join(destDir, header.Name)
-
-		// Prevent path traversal.
-		cleanDest := filepath.Clean(destDir) + string(os.PathSeparator)
-		if !strings.HasPrefix(filepath.Clean(target), cleanDest) {
-			return fmt.Errorf("invalid path in archive: %s", header.Name)
-		}
-
-		switch header.Typeflag {
-		case tar.TypeDir:
-			if err := os.MkdirAll(target, 0o755); err != nil {
-				return err
-			}
-		case tar.TypeReg:
-			if header.Size > 1<<32 {
-				return fmt.Errorf("file too large: %s (%d bytes)", header.Name, header.Size)
-			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
-			}
-			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode)&0o777)
-			if err != nil {
-				return err
-			}
-			if _, err := io.Copy(f, io.LimitReader(tr, 1<<32)); err != nil {
-				_ = f.Close()
-				return err
-			}
-			if err := f.Close(); err != nil {
-				return err
-			}
-		}
-	}
-	return nil
-}
-
-// ── S3 client ────────────────────────────────────────────────────────────────
-
-func newS3Client(ctx context.Context) (*s3.Client, error) {
-	awsCfg, err := awsconfig.LoadDefaultConfig(ctx)
-	if err != nil {
-		return nil, err
-	}
-
-	return s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		// R2 and other S3-compatible storage requires path-style access.
-		o.UsePathStyle = true
-	}), nil
 }

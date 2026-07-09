@@ -1,12 +1,15 @@
 # snapshot-sidecar
 
-A generic Kubernetes sidecar for snapshotting project directories to
-S3-compatible storage. It runs alongside your application pod, periodically (or
-on-demand) creates deduplicated tar.gz snapshots, and uploads them to any
-S3-compatible backend (AWS S3, Cloudflare R2, MinIO, etc.).
+A generic Kubernetes sidecar for persisting project directories, with two
+interchangeable backends selected via `SNAPSHOT_BACKEND`:
 
-On startup, the `restore` command downloads the latest snapshot — giving
-stateless pods persistent project state without requiring persistent volumes.
+- **`s3`** (default) — periodically (or on-demand) creates deduplicated tar.gz
+  snapshots and uploads them to any S3-compatible backend (AWS S3, Cloudflare
+  R2, MinIO, etc.). On startup, `restore` downloads the latest snapshot —
+  giving stateless pods persistent project state without persistent volumes.
+- **`git`** — the project directory is a working clone of a git remote (e.g. an
+  in-cluster Gitea repo). Save = commit + plain push, sync = fast-forward pull.
+  See [Git backend](#git-backend).
 
 ## How it works
 
@@ -78,30 +81,83 @@ Pre-built images are available at `ghcr.io/fairtier/snapshot-sidecar`.
 
 All configuration is via environment variables:
 
-| Variable                | Default        | Description                                               |
-|-------------------------|----------------|-----------------------------------------------------------|
-| `S3_BUCKET`             | *(required)*   | S3 bucket name                                            |
-| `SNAPSHOT_PROJECT_DIR`  | `/project`     | Directory to snapshot                                     |
-| `SNAPSHOT_PREFIX`       | `snapshots`    | S3 key prefix for snapshots                               |
-| `AUTOSAVE_INTERVAL`     | `0` (disabled) | Auto-save interval (e.g. `5m`, `1h`)                      |
-| `LISTEN_ADDR`           | `:8484`        | ConnectRPC server listen address                          |
-| `SNAPSHOT_EXCLUDE_DIRS` | *(empty)*      | Comma-separated directories to exclude (e.g. `tmp,stage`) |
+| Variable               | Default        | Description                          |
+|------------------------|----------------|--------------------------------------|
+| `SNAPSHOT_BACKEND`     | `s3`           | Persistence backend: `s3` or `git`   |
+| `SNAPSHOT_PROJECT_DIR` | `/project`     | Directory to snapshot                |
+| `AUTOSAVE_INTERVAL`    | `0` (disabled) | Auto-save interval (e.g. `5m`, `1h`) |
+| `LISTEN_ADDR`          | `:8484`        | ConnectRPC server listen address     |
+
+**s3 backend:**
+
+| Variable                | Default      | Description                                               |
+|-------------------------|--------------|-----------------------------------------------------------|
+| `S3_BUCKET`             | *(required)* | S3 bucket name                                            |
+| `SNAPSHOT_PREFIX`       | `snapshots`  | S3 key prefix for snapshots                               |
+| `SNAPSHOT_EXCLUDE_DIRS` | *(empty)*    | Comma-separated directories to exclude (e.g. `tmp,stage`) |
 
 S3 credentials are read via the standard AWS SDK environment variables (
 `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL`, `AWS_REGION`).
+
+**git backend:**
+
+| Variable           | Default                         | Description                                        |
+|--------------------|---------------------------------|----------------------------------------------------|
+| `GIT_REMOTE_URL`   | *(required)*                    | HTTP(S) remote URL                                 |
+| `GIT_TOKEN`        | *(required)*                    | Access token (HTTP basic auth password)            |
+| `GIT_USERNAME`     | `git`                           | HTTP basic auth username                           |
+| `GIT_BRANCH`       | `main`                          | Branch to track                                    |
+| `GIT_AUTHOR_NAME`  | `FairTier Autosave`             | Commit author name                                 |
+| `GIT_AUTHOR_EMAIL` | `snapshot-sidecar@fairtier.com` | Commit author email                                |
+| `SYNC_INTERVAL`    | `0` (disabled)                  | Fast-forward pull interval (e.g. `1m`)             |
+
+The token is passed in-process per request (pure-Go git via
+[go-git](https://github.com/go-git/go-git)) — it is never written to
+`.git/config` or disk. Ignore rules come from the repo's own `.gitignore`.
 
 ## API
 
 The sidecar exposes a ConnectRPC service (compatible with gRPC, gRPC-Web, and
 Connect protocols):
 
-| RPC               | Description                                                               |
-|-------------------|---------------------------------------------------------------------------|
-| `TriggerSnapshot` | Create a snapshot immediately. Returns `created`, `unchanged`, or `busy`. |
-| `ListSnapshots`   | List all snapshots in the S3 prefix.                                      |
+| RPC               | Description                                                                                 |
+|-------------------|---------------------------------------------------------------------------------------------|
+| `TriggerSnapshot` | Create a snapshot immediately. Returns `created`, `unchanged`, `busy`, or `remote_changed`. |
+| `ListSnapshots`   | List snapshots: S3 objects under the prefix, or git commits (newest first, capped at 50).   |
 
 gRPC health checking is available via the standard `grpc.health.v1.Health`
 service.
+
+## Git backend
+
+The project directory is a working clone; "snapshot" maps onto git verbs.
+The policy is **optimistic concurrency: never force, never auto-merge** — a
+plain push being rejected *is* the "somebody else changed the data" signal.
+
+- **restore** (init container) — open the existing clone, or *adopt* a plain
+  directory: init, fetch, point the branch at the remote head, and materialize
+  only files missing on disk. Existing local files are never overwritten —
+  they become uncommitted modifications for the next save. On an empty remote,
+  the directory content is committed and pushed as the initial import.
+- **save** (`TriggerSnapshot` / `AUTOSAVE_INTERVAL` / SIGTERM) — commit the
+  dirty working tree (`.gitignore`-aware), then plain push. A non-fast-forward
+  rejection returns status `remote_changed`; the commit stays local and a later
+  save retries the push once the remote is fast-forwardable again.
+- **sync** (`SYNC_INTERVAL` loop) — fetch, then fast-forward pull, but ONLY
+  when the tree is clean and no local commits are unpushed. Diverged or dirty
+  states are left alone and reported.
+
+`GET /debug/sync-status` (same port) returns the current relation to the
+remote as JSON:
+
+```json
+{"state": "in-sync", "head": "…", "remoteHead": "…", "lastFetch": "…"}
+```
+
+`state` is one of `in-sync`, `dirty` (uncommitted local changes), `ahead`
+(unpushed local commits), `behind` (remote commits not yet pulled), or
+`diverged` (both — needs a human: make the remote fast-forwardable, or
+rebase/merge the clone manually, then save again).
 
 ### Example with `buf curl`
 

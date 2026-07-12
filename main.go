@@ -17,6 +17,7 @@ package main
 
 import (
 	"context"
+	"crypto/subtle"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -111,6 +112,7 @@ type envConfig struct {
 	ProjectDir       string        // SNAPSHOT_PROJECT_DIR (default: /project)
 	AutosaveInterval time.Duration // AUTOSAVE_INTERVAL (default: 0 = disabled)
 	ListenAddr       string        // LISTEN_ADDR (default: :8484)
+	AuthToken        string        // AUTH_TOKEN (optional: require this bearer on RPC + debug; health stays open)
 
 	// s3 backend
 	S3Bucket       string   // S3_BUCKET (required for s3)
@@ -140,6 +142,7 @@ func loadConfig() (envConfig, error) {
 		GitToken:       os.Getenv("GIT_TOKEN"),
 		GitAuthorName:  envOr("GIT_AUTHOR_NAME", "FairTier Autosave"),
 		GitAuthorEmail: envOr("GIT_AUTHOR_EMAIL", "snapshot-sidecar@fairtier.com"),
+		AuthToken:      os.Getenv("AUTH_TOKEN"),
 	}
 
 	switch c.Backend {
@@ -222,14 +225,25 @@ func runServe(logger *slog.Logger) error {
 		return err
 	}
 
+	// Service + debug live on an inner mux so the optional bearer gate
+	// covers both; gRPC health stays on the outer mux, open for kubelet
+	// probes (which cannot send headers).
+	inner := http.NewServeMux()
+	inner.Handle(snapshotv1connect.NewSnapshotServiceHandler(b))
+	if d, ok := b.(interface{ registerDebug(*http.ServeMux) }); ok {
+		d.registerDebug(inner)
+	}
+
+	var gated http.Handler = inner
+	if cfg.AuthToken != "" {
+		gated = requireBearer(cfg.AuthToken, inner)
+	}
+
 	mux := http.NewServeMux()
-	mux.Handle(snapshotv1connect.NewSnapshotServiceHandler(b))
+	mux.Handle("/", gated)
 	mux.Handle(grpchealth.NewHandler(grpchealth.NewStaticChecker(
 		snapshotv1connect.SnapshotServiceName,
 	)))
-	if d, ok := b.(interface{ registerDebug(*http.ServeMux) }); ok {
-		d.registerDebug(mux)
-	}
 
 	// h2c: gRPC/Connect clients speak HTTP/2 without TLS in-cluster.
 	var protocols http.Protocols
@@ -302,6 +316,22 @@ func runServe(logger *slog.Logger) error {
 
 	logger.Info("sidecar stopped")
 	return nil
+}
+
+// requireBearer gates a handler behind a static bearer token
+// (constant-time compare). Used when the sidecar is exposed beyond the
+// pod — e.g. the box publishes it through its Ingress so central can
+// proxy Console Save requests.
+func requireBearer(token string, next http.Handler) http.Handler {
+	want := []byte(token)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
+		if !ok || subtle.ConstantTimeCompare([]byte(got), want) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func autosaveLoop(ctx context.Context, logger *slog.Logger, b backend, interval time.Duration) {

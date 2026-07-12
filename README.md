@@ -87,6 +87,7 @@ All configuration is via environment variables:
 | `SNAPSHOT_PROJECT_DIR` | `/project`     | Directory to snapshot                |
 | `AUTOSAVE_INTERVAL`    | `0` (disabled) | Auto-save interval (e.g. `5m`, `1h`) |
 | `LISTEN_ADDR`          | `:8484`        | ConnectRPC server listen address     |
+| `AUTH_TOKEN`           | (unset = open) | When set, RPC + debug endpoints require `Authorization: Bearer <token>`; gRPC health stays open for kubelet probes. Set it whenever the sidecar is reachable beyond its pod (e.g. published through an Ingress). |
 
 **s3 backend:**
 

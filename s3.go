@@ -24,6 +24,9 @@ import (
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 
 	snapshotv1 "github.com/fairtier/snapshot-sidecar/proto/snapshot/v1"
 )
@@ -134,21 +137,46 @@ func (s *snapshotter) ListSnapshots(
 	}), nil
 }
 
-func (s *snapshotter) save(ctx context.Context) (*snapshotv1.TriggerSnapshotResponse, error) {
+func (s *snapshotter) save(ctx context.Context) (resp *snapshotv1.TriggerSnapshotResponse, err error) {
+	ctx, span := tel.tracer.Start(ctx, "snapshot.save", trace.WithAttributes(
+		attrBackend.String(backendS3),
+		attrTrigger.String(triggerFrom(ctx)),
+	))
+	defer span.End()
+
+	start := time.Now()
+	defer func() {
+		status := "error"
+		if resp != nil {
+			status = resp.GetStatus()
+		}
+		span.SetAttributes(attrStatus.String(status))
+		recordErr(span, err)
+		tel.saveDuration.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(
+			withErrType([]attribute.KeyValue{
+				attrBackend.String(backendS3),
+				attrStatus.String(status),
+			}, err)...,
+		))
+	}()
+
 	// Prevent concurrent snapshots.
 	if !s.busyMu.TryLock() {
+		span.AddEvent("save skipped: another snapshot in flight")
 		return &snapshotv1.TriggerSnapshotResponse{Status: "busy"}, nil
 	}
 	defer s.busyMu.Unlock()
 
 	// Create tar.gz in memory and compute hash.
-	buf, hash, err := s.tarProjectDir()
+	buf, hash, err := s.tarProjectDir(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("create archive: %w", err)
 	}
+	span.SetAttributes(attrHash.String(hash))
 
 	// Deduplicate.
 	if s.isUnchanged(hash) {
+		span.AddEvent("archive unchanged since last snapshot, upload skipped")
 		s.logger.Info("snapshot unchanged, skipping upload", "hash", shortHash(hash))
 		return &snapshotv1.TriggerSnapshotResponse{Status: "unchanged", Hash: hash}, nil
 	}
@@ -160,6 +188,7 @@ func (s *snapshotter) save(ctx context.Context) (*snapshotv1.TriggerSnapshotResp
 		now.Format("20060102T150405Z"),
 		shortHash(hash),
 	)
+	span.SetAttributes(attrKey.String(key))
 
 	if err := s.uploadBytes(ctx, key, buf); err != nil {
 		return nil, fmt.Errorf("upload snapshot: %w", err)
@@ -175,6 +204,7 @@ func (s *snapshotter) save(ctx context.Context) (*snapshotv1.TriggerSnapshotResp
 	if err := s.uploadBytes(ctx, markerKey, markerJSON); err != nil {
 		return nil, fmt.Errorf("upload latest marker: %w", err)
 	}
+	span.AddEvent("latest marker updated")
 
 	s.setLastHash(hash)
 
@@ -182,8 +212,18 @@ func (s *snapshotter) save(ctx context.Context) (*snapshotv1.TriggerSnapshotResp
 	return &snapshotv1.TriggerSnapshotResponse{Status: "created", Key: key, Hash: hash}, nil
 }
 
-func (s *snapshotter) tarProjectDir() ([]byte, string, error) {
+// tarProjectDir walks the project dir into an in-memory tar.gz. It gets its
+// own span: on a large project this dominates save latency, and the
+// files/bytes it records are what explains a slow one.
+func (s *snapshotter) tarProjectDir(ctx context.Context) (_ []byte, _ string, err error) {
+	ctx, span := tel.tracer.Start(ctx, "snapshot.archive")
+	defer func() {
+		recordErr(span, err)
+		span.End()
+	}()
+
 	var buf bytes.Buffer
+	var files int64
 	h := sha256.New()
 
 	// Write tar.gz to both buf and hasher.
@@ -191,7 +231,7 @@ func (s *snapshotter) tarProjectDir() ([]byte, string, error) {
 	gw := gzip.NewWriter(mw)
 	tw := tar.NewWriter(gw)
 
-	err := filepath.WalkDir(s.cfg.ProjectDir, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(s.cfg.ProjectDir, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -230,6 +270,7 @@ func (s *snapshotter) tarProjectDir() ([]byte, string, error) {
 		if d.IsDir() {
 			return nil
 		}
+		files++
 
 		f, err := os.Open(path)
 		if err != nil {
@@ -244,18 +285,36 @@ func (s *snapshotter) tarProjectDir() ([]byte, string, error) {
 		return nil, "", err
 	}
 
-	if err := tw.Close(); err != nil {
+	if err = tw.Close(); err != nil {
 		return nil, "", err
 	}
-	if err := gw.Close(); err != nil {
+	if err = gw.Close(); err != nil {
 		return nil, "", err
 	}
+
+	size := int64(buf.Len())
+	span.SetAttributes(
+		attribute.Int64("snapshot.archive.files", files),
+		attribute.Int64("snapshot.archive.size", size),
+	)
+	attrs := metric.WithAttributes(attrBackend.String(backendS3))
+	tel.archiveFiles.Record(ctx, files, attrs)
+	tel.archiveSize.Record(ctx, size, attrs)
 
 	return buf.Bytes(), hex.EncodeToString(h.Sum(nil)), nil
 }
 
-func (s *snapshotter) uploadBytes(ctx context.Context, key string, data []byte) error {
-	_, err := s.s3.PutObject(ctx, &s3.PutObjectInput{
+func (s *snapshotter) uploadBytes(ctx context.Context, key string, data []byte) (err error) {
+	ctx, span := tel.tracer.Start(ctx, "s3.PutObject", trace.WithAttributes(
+		attrKey.String(key),
+		attribute.Int("s3.body.size", len(data)),
+	))
+	defer func() {
+		recordErr(span, err)
+		span.End()
+	}()
+
+	_, err = s.s3.PutObject(ctx, &s3.PutObjectInput{
 		Bucket: &s.cfg.S3Bucket,
 		Key:    &key,
 		Body:   bytes.NewReader(data),
@@ -288,6 +347,8 @@ func restoreS3(ctx context.Context, logger *slog.Logger, cfg envConfig) error {
 		return fmt.Errorf("create S3 client: %w", err)
 	}
 
+	span := trace.SpanFromContext(ctx)
+
 	// Read latest.json marker.
 	markerKey := cfg.SnapshotPrefix + "/latest.json"
 	markerResp, err := s3Client.GetObject(ctx, &s3.GetObjectInput{
@@ -296,6 +357,8 @@ func restoreS3(ctx context.Context, logger *slog.Logger, cfg envConfig) error {
 	})
 	if err != nil {
 		if errors.As(err, new(*types.NoSuchKey)) || errors.As(err, new(*types.NotFound)) {
+			// First boot, not a failure — keep the span green.
+			span.AddEvent("no latest.json marker, starting fresh")
 			logger.Info("no snapshot found, starting fresh")
 			return nil
 		}
@@ -308,6 +371,7 @@ func restoreS3(ctx context.Context, logger *slog.Logger, cfg envConfig) error {
 		return fmt.Errorf("decode latest.json: %w", err)
 	}
 
+	span.SetAttributes(attrKey.String(marker.Key), attrHash.String(marker.Hash))
 	logger.Info("restoring snapshot", "key", marker.Key)
 
 	// Download the snapshot tar.gz.
@@ -320,19 +384,28 @@ func restoreS3(ctx context.Context, logger *slog.Logger, cfg envConfig) error {
 	}
 	defer func() { _ = snapResp.Body.Close() }()
 
-	// Extract to project directory.
-	if err := extractTarGz(snapResp.Body, cfg.ProjectDir); err != nil {
+	// Extract to project directory. The download streams through the
+	// extractor, so this span covers both.
+	_, extractSpan := tel.tracer.Start(ctx, "snapshot.extract",
+		trace.WithAttributes(attrKey.String(marker.Key)))
+	files, err := extractTarGz(snapResp.Body, cfg.ProjectDir)
+	extractSpan.SetAttributes(attribute.Int64("snapshot.archive.files", files))
+	recordErr(extractSpan, err)
+	extractSpan.End()
+	if err != nil {
 		return fmt.Errorf("extract snapshot: %w", err)
 	}
 
-	logger.Info("snapshot restored", "key", marker.Key)
+	logger.Info("snapshot restored", "key", marker.Key, "files", files)
 	return nil
 }
 
-func extractTarGz(r io.Reader, destDir string) error {
+// extractTarGz unpacks into destDir and reports how many regular files it
+// wrote (the restore span's payload measure).
+func extractTarGz(r io.Reader, destDir string) (files int64, _ error) {
 	gr, err := gzip.NewReader(r)
 	if err != nil {
-		return err
+		return files, err
 	}
 	defer func() { _ = gr.Close() }()
 
@@ -343,7 +416,7 @@ func extractTarGz(r io.Reader, destDir string) error {
 			break
 		}
 		if err != nil {
-			return err
+			return files, err
 		}
 
 		target := filepath.Join(destDir, header.Name)
@@ -351,35 +424,36 @@ func extractTarGz(r io.Reader, destDir string) error {
 		// Prevent path traversal.
 		cleanDest := filepath.Clean(destDir) + string(os.PathSeparator)
 		if !strings.HasPrefix(filepath.Clean(target), cleanDest) {
-			return fmt.Errorf("invalid path in archive: %s", header.Name)
+			return files, fmt.Errorf("invalid path in archive: %s", header.Name)
 		}
 
 		switch header.Typeflag {
 		case tar.TypeDir:
 			if err := os.MkdirAll(target, 0o755); err != nil {
-				return err
+				return files, err
 			}
 		case tar.TypeReg:
 			if header.Size > 1<<32 {
-				return fmt.Errorf("file too large: %s (%d bytes)", header.Name, header.Size)
+				return files, fmt.Errorf("file too large: %s (%d bytes)", header.Name, header.Size)
 			}
 			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-				return err
+				return files, err
 			}
 			f, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, os.FileMode(header.Mode)&0o777)
 			if err != nil {
-				return err
+				return files, err
 			}
 			if _, err := io.Copy(f, io.LimitReader(tr, 1<<32)); err != nil {
 				_ = f.Close()
-				return err
+				return files, err
 			}
 			if err := f.Close(); err != nil {
-				return err
+				return files, err
 			}
+			files++
 		}
 	}
-	return nil
+	return files, nil
 }
 
 // ── S3 client ────────────────────────────────────────────────────────────────

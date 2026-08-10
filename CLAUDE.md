@@ -38,6 +38,14 @@ Small Go binary, one file per concern:
   (`SYNC_INTERVAL`), `GET /debug/sync-status`. Pure-Go git via go-git v6;
   the token travels in-process (`ClientOptions`/`WithHTTPAuth`), never
   touching `.git/config`.
+- `otel.go` — OpenTelemetry: SDK setup (OTLP/HTTP, off unless
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is set), the shared instrument set (`tel`),
+  attribute keys, and the `withTrigger`/`triggerFrom` context tag that tells
+  an RPC save apart from an autosave/SIGTERM one. Instruments hang off the
+  OTel *global* providers, which delegate once the SDK is installed — so
+  `tel` is safe to build at package init and in tests that never call
+  `setupOTel`. Backends add spans/metrics inline; see README for the
+  span tree and metric list.
 
 Subcommands:
 
@@ -71,7 +79,8 @@ All via environment variables — see [README.md](README.md) for the full table.
 S3 credentials use standard AWS SDK env vars (`AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL`, `AWS_REGION`); the git backend
 uses `GIT_REMOTE_URL`/`GIT_TOKEN` (+ optional `GIT_BRANCH`, `GIT_USERNAME`,
-`GIT_AUTHOR_*`, `SYNC_INTERVAL`).
+`GIT_AUTHOR_*`, `SYNC_INTERVAL`). Telemetry uses the standard `OTEL_*` env
+vars and stays off until an OTLP endpoint is set.
 
 ## CI
 
@@ -87,3 +96,5 @@ uses `GIT_REMOTE_URL`/`GIT_TOKEN` (+ optional `GIT_BRANCH`, `GIT_USERNAME`,
 | `github.com/aws/aws-sdk-go-v2` | S3 client                   |
 | `github.com/go-git/go-git/v6`  | Pure-Go git (git backend)   |
 | `google.golang.org/protobuf`   | Protobuf runtime            |
+| `go.opentelemetry.io/otel`     | Traces + metrics (OTLP/HTTP)|
+| `connectrpc.com/otelconnect`   | RPC spans + `rpc.server.*`  |

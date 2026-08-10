@@ -30,7 +30,12 @@ import (
 	"syscall"
 	"time"
 
+	"connectrpc.com/connect"
 	"connectrpc.com/grpchealth"
+	"connectrpc.com/otelconnect"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 
 	snapshotv1 "github.com/fairtier/snapshot-sidecar/proto/snapshot/v1"
 	"github.com/fairtier/snapshot-sidecar/proto/snapshot/v1/snapshotv1connect"
@@ -83,10 +88,15 @@ func main() {
 }
 
 func printVersion() {
+	fmt.Println("snapshot-sidecar", buildVersion())
+}
+
+// buildVersion is the module version plus VCS stamps — also reported as
+// service.version on the OTel resource.
+func buildVersion() string {
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
-		fmt.Println("snapshot-sidecar (unknown)")
-		return
+		return "unknown"
 	}
 
 	version := info.Main.Version
@@ -103,7 +113,7 @@ func printVersion() {
 		}
 	}
 
-	fmt.Println("snapshot-sidecar", version)
+	return version
 }
 
 // envConfig reads configuration from environment variables.
@@ -220,16 +230,38 @@ func runServe(logger *slog.Logger) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	otelShutdown, err := setupOTel(ctx, logger)
+	if err != nil {
+		return fmt.Errorf("setup otel: %w", err)
+	}
+	defer func() {
+		// Detached from ctx: by the time this runs, ctx is the cancelled
+		// SIGTERM context and the exporter would refuse to flush.
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer flushCancel()
+		if err := otelShutdown(flushCtx); err != nil {
+			logger.Warn("otel shutdown", "err", err)
+		}
+	}()
+
 	b, err := newBackend(ctx, logger, cfg)
 	if err != nil {
 		return err
+	}
+
+	// RPC spans + rpc.server.* metrics. WithTrustRemote makes an incoming
+	// traceparent the parent (not just a link): callers are in-cluster
+	// (central's Console Save), and one continuous trace is the point.
+	otelInterceptor, err := otelconnect.NewInterceptor(otelconnect.WithTrustRemote())
+	if err != nil {
+		return fmt.Errorf("otel interceptor: %w", err)
 	}
 
 	// Service + debug live on an inner mux so the optional bearer gate
 	// covers both; gRPC health stays on the outer mux, open for kubelet
 	// probes (which cannot send headers).
 	inner := http.NewServeMux()
-	inner.Handle(snapshotv1connect.NewSnapshotServiceHandler(b))
+	inner.Handle(snapshotv1connect.NewSnapshotServiceHandler(b, connect.WithInterceptors(otelInterceptor)))
 	if d, ok := b.(interface{ registerDebug(*http.ServeMux) }); ok {
 		d.registerDebug(inner)
 	}
@@ -303,6 +335,7 @@ func runServe(logger *slog.Logger) error {
 	// SIGTERM snapshot — use a fresh context with a deadline.
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 25*time.Second)
 	defer shutdownCancel()
+	shutdownCtx = withTrigger(shutdownCtx, triggerShutdown)
 
 	if resp, err := b.save(shutdownCtx); err != nil {
 		logger.Error("shutdown snapshot failed", "err", err)
@@ -338,6 +371,8 @@ func autosaveLoop(ctx context.Context, logger *slog.Logger, b backend, interval 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
+	ctx = withTrigger(ctx, triggerAutosave)
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -363,10 +398,34 @@ func runRestore(logger *slog.Logger) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
+	otelShutdown, err := setupOTel(ctx, logger)
+	if err != nil {
+		return fmt.Errorf("setup otel: %w", err)
+	}
+	defer func() {
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), shutdownTimeout)
+		defer flushCancel()
+		if err := otelShutdown(flushCtx); err != nil {
+			logger.Warn("otel shutdown", "err", err)
+		}
+	}()
+
+	ctx = withTrigger(ctx, triggerRestore)
+	ctx, span := tel.tracer.Start(ctx, "snapshot.restore",
+		trace.WithAttributes(attrBackend.String(cfg.Backend)))
+	defer span.End()
+
+	start := time.Now()
 	switch cfg.Backend {
 	case backendGit:
-		return restoreGit(ctx, logger, cfg)
+		err = restoreGit(ctx, logger, cfg)
 	default:
-		return restoreS3(ctx, logger, cfg)
+		err = restoreS3(ctx, logger, cfg)
 	}
+
+	recordErr(span, err)
+	tel.restoreDuration.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(
+		withErrType([]attribute.KeyValue{attrBackend.String(cfg.Backend)}, err)...,
+	))
+	return err
 }

@@ -21,6 +21,9 @@ import (
 	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport"
 	githttp "github.com/go-git/go-git/v6/plumbing/transport/http"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 
 	snapshotv1 "github.com/fairtier/snapshot-sidecar/proto/snapshot/v1"
 )
@@ -116,6 +119,22 @@ func newGitBackend(ctx context.Context, logger *slog.Logger, cfg envConfig) (*gi
 	}
 
 	b.repo, b.wt = repo, wt
+
+	// snapshot.git.state is sampled from the live classifier. classify() is
+	// local-only (refs + worktree status), so collection stays cheap; skip it
+	// while a save/sync holds the lock rather than blocking the collector.
+	if err := tel.observeGitState(func() string {
+		if !b.busyMu.TryLock() {
+			b.stateMu.Lock()
+			defer b.stateMu.Unlock()
+			return b.state.State
+		}
+		defer b.busyMu.Unlock()
+		return b.refreshState()
+	}); err != nil {
+		return nil, fmt.Errorf("register git state gauge: %w", err)
+	}
+
 	return b, nil
 }
 
@@ -150,7 +169,15 @@ func (b *gitBackend) ensureRemote(repo *git.Repository) error {
 //     for the next save — adoption itself never creates divergence.
 //   - remote empty: commit whatever is present (plus a default .gitignore)
 //     and push the initial import.
-func (b *gitBackend) adopt(ctx context.Context) (*git.Repository, error) {
+func (b *gitBackend) adopt(ctx context.Context) (_ *git.Repository, err error) {
+	ctx, span := tel.tracer.Start(ctx, "git.adopt", trace.WithAttributes(
+		attribute.String("git.branch", b.cfg.GitBranch),
+	))
+	defer func() {
+		recordErr(span, err)
+		span.End()
+	}()
+
 	branchRef := plumbing.NewBranchReferenceName(b.cfg.GitBranch)
 
 	repo, err := git.PlainInit(b.cfg.ProjectDir, false, git.WithDefaultBranch(branchRef))
@@ -172,9 +199,12 @@ func (b *gitBackend) adopt(ctx context.Context) (*git.Repository, error) {
 		return nil, fmt.Errorf("create branch config: %w", err)
 	}
 
-	err = repo.FetchContext(ctx, &git.FetchOptions{RemoteName: defaultRemote, ClientOptions: b.clientOpts})
+	err = b.remoteOp(ctx, "git.fetch", func(ctx context.Context) error {
+		return repo.FetchContext(ctx, &git.FetchOptions{RemoteName: defaultRemote, ClientOptions: b.clientOpts})
+	})
 	switch {
 	case errors.Is(err, transport.ErrEmptyRemoteRepository):
+		span.SetAttributes(attribute.String("git.adopt.mode", "empty-remote"))
 		return repo, b.adoptEmptyRemote(ctx, repo)
 	case err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate):
 		return nil, fmt.Errorf("fetch: %w", err)
@@ -184,6 +214,7 @@ func (b *gitBackend) adopt(ctx context.Context) (*git.Repository, error) {
 	if errors.Is(err, plumbing.ErrReferenceNotFound) {
 		// Remote has refs but not our branch — same as an empty remote from
 		// this branch's point of view.
+		span.SetAttributes(attribute.String("git.adopt.mode", "branch-missing"))
 		return repo, b.adoptEmptyRemote(ctx, repo)
 	}
 	if err != nil {
@@ -214,6 +245,11 @@ func (b *gitBackend) adopt(ctx context.Context) (*git.Repository, error) {
 		return nil, err
 	}
 
+	span.SetAttributes(
+		attribute.String("git.adopt.mode", "existing-remote"),
+		attribute.Int("git.adopt.files_written", written),
+		attrHash.String(remoteRef.Hash().String()),
+	)
 	b.logger.Info("adopted existing directory",
 		"remote", remoteRef.Hash().String(),
 		"filesWritten", written,
@@ -299,9 +335,12 @@ func (b *gitBackend) adoptEmptyRemote(ctx context.Context, repo *git.Repository)
 		return fmt.Errorf("commit initial import: %w", err)
 	}
 
-	err = repo.PushContext(ctx, &git.PushOptions{RemoteName: defaultRemote, ClientOptions: b.clientOpts})
+	err = b.remoteOp(ctx, "git.push", func(ctx context.Context) error {
+		return repo.PushContext(ctx, &git.PushOptions{RemoteName: defaultRemote, ClientOptions: b.clientOpts})
+	})
 	if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
 		// Lost a race against another writer — serve's save loop retries.
+		trace.SpanFromContext(ctx).AddEvent("initial import push failed, save loop will retry")
 		b.logger.Warn("initial import push failed", "err", err)
 		return nil
 	}
@@ -397,8 +436,32 @@ var errIterDone = errors.New("iteration done")
 // rejection → status "remote_changed" (the commit stays local). A repeated
 // save after the remote was made fast-forwardable retries the push — that
 // is the resolution path.
-func (b *gitBackend) save(ctx context.Context) (*snapshotv1.TriggerSnapshotResponse, error) {
+func (b *gitBackend) save(ctx context.Context) (resp *snapshotv1.TriggerSnapshotResponse, err error) {
+	ctx, span := tel.tracer.Start(ctx, "snapshot.save", trace.WithAttributes(
+		attrBackend.String(backendGit),
+		attrTrigger.String(triggerFrom(ctx)),
+		attribute.String("git.branch", b.cfg.GitBranch),
+	))
+	defer span.End()
+
+	start := time.Now()
+	defer func() {
+		status := "error"
+		if resp != nil {
+			status = resp.GetStatus()
+		}
+		span.SetAttributes(attrStatus.String(status))
+		recordErr(span, err)
+		tel.saveDuration.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(
+			withErrType([]attribute.KeyValue{
+				attrBackend.String(backendGit),
+				attrStatus.String(status),
+			}, err)...,
+		))
+	}()
+
 	if !b.busyMu.TryLock() {
+		span.AddEvent("save skipped: a save or sync is already running")
 		return &snapshotv1.TriggerSnapshotResponse{Status: "busy"}, nil
 	}
 	defer b.busyMu.Unlock()
@@ -409,7 +472,9 @@ func (b *gitBackend) save(ctx context.Context) (*snapshotv1.TriggerSnapshotRespo
 		return nil, fmt.Errorf("status: %w", err)
 	}
 
+	span.SetAttributes(attribute.Bool("git.worktree.dirty", !status.IsClean()))
 	if !status.IsClean() {
+		span.SetAttributes(attribute.Int("git.worktree.changed_files", len(status)))
 		if err := b.wt.AddWithOptions(&git.AddOptions{All: true}); err != nil {
 			return nil, fmt.Errorf("add: %w", err)
 		}
@@ -418,6 +483,7 @@ func (b *gitBackend) save(ctx context.Context) (*snapshotv1.TriggerSnapshotRespo
 			!errors.Is(err, git.ErrEmptyCommit) {
 			return nil, fmt.Errorf("commit: %w", err)
 		}
+		span.AddEvent("commit created")
 	}
 
 	head, err := b.repo.Head()
@@ -426,6 +492,7 @@ func (b *gitBackend) save(ctx context.Context) (*snapshotv1.TriggerSnapshotRespo
 	}
 	hash := head.Hash().String()
 	key := fmt.Sprintf("%s@%s", b.cfg.GitBranch, shortHash(hash))
+	span.SetAttributes(attrKey.String(key), attrHash.String(hash))
 
 	if remoteRef, err := b.repo.Reference(
 		plumbing.NewRemoteReferenceName(defaultRemote, b.cfg.GitBranch), true,
@@ -433,7 +500,9 @@ func (b *gitBackend) save(ctx context.Context) (*snapshotv1.TriggerSnapshotRespo
 		return &snapshotv1.TriggerSnapshotResponse{Status: "unchanged", Hash: hash}, nil
 	}
 
-	err = b.repo.PushContext(ctx, &git.PushOptions{RemoteName: defaultRemote, ClientOptions: b.clientOpts})
+	err = b.remoteOp(ctx, "git.push", func(ctx context.Context) error {
+		return b.repo.PushContext(ctx, &git.PushOptions{RemoteName: defaultRemote, ClientOptions: b.clientOpts})
+	})
 	switch {
 	case err == nil, errors.Is(err, git.NoErrAlreadyUpToDate):
 		b.stateMu.Lock()
@@ -442,11 +511,40 @@ func (b *gitBackend) save(ctx context.Context) (*snapshotv1.TriggerSnapshotRespo
 		b.logger.Info("saved", "key", key)
 		return &snapshotv1.TriggerSnapshotResponse{Status: "created", Key: key, Hash: hash}, nil
 	case isNonFastForward(err):
+		// Not an error for the caller — the commit is safe locally and a
+		// human resolves the divergence — but worth an event on the trace.
+		span.AddEvent("push rejected: non-fast-forward, commit kept local")
 		b.logger.Warn("push rejected: remote changed", "key", key)
 		return &snapshotv1.TriggerSnapshotResponse{Status: "remote_changed", Key: key, Hash: hash}, nil
 	default:
 		return nil, fmt.Errorf("push: %w", err)
 	}
+}
+
+// remoteOp wraps a fetch/push/pull in a span. Up-to-date, empty-remote and
+// non-fast-forward outcomes are routine here (first boot, idle box, human
+// pushed to the remote), so they land as attributes rather than span errors;
+// the caller decides what is actually fatal.
+func (b *gitBackend) remoteOp(ctx context.Context, name string, fn func(context.Context) error) error {
+	ctx, span := tel.tracer.Start(ctx, name, trace.WithAttributes(
+		attribute.String("git.branch", b.cfg.GitBranch),
+		attribute.String("git.remote", defaultRemote),
+	))
+	defer span.End()
+
+	err := fn(ctx)
+	switch {
+	case err == nil:
+	case errors.Is(err, git.NoErrAlreadyUpToDate):
+		span.SetAttributes(attribute.Bool("git.up_to_date", true))
+	case errors.Is(err, transport.ErrEmptyRemoteRepository):
+		span.SetAttributes(attribute.Bool("git.remote_empty", true))
+	case isNonFastForward(err):
+		span.SetAttributes(attribute.Bool("git.non_fast_forward", true))
+	default:
+		recordErr(span, err)
+	}
+	return err
 }
 
 func isNonFastForward(err error) bool {
@@ -479,42 +577,67 @@ func (b *gitBackend) syncLoop(ctx context.Context, interval time.Duration) {
 	}
 }
 
-func (b *gitBackend) syncOnce(ctx context.Context) error {
+func (b *gitBackend) syncOnce(ctx context.Context) (err error) {
+	ctx, span := tel.tracer.Start(ctx, "snapshot.sync", trace.WithAttributes(
+		attribute.String("git.branch", b.cfg.GitBranch),
+	))
+	defer span.End()
+
+	start := time.Now()
+	result := "skipped"
+	defer func() {
+		span.SetAttributes(attrSyncResult.String(result))
+		recordErr(span, err)
+		tel.syncDuration.Record(ctx, time.Since(start).Seconds(), metric.WithAttributes(
+			withErrType([]attribute.KeyValue{attrSyncResult.String(result)}, err)...,
+		))
+	}()
+
 	if !b.busyMu.TryLock() {
-		return nil // a save is running; next tick catches up
+		span.AddEvent("sync skipped: a save is running, next tick catches up")
+		return nil
 	}
 	defer b.busyMu.Unlock()
 
-	err := b.repo.FetchContext(ctx, &git.FetchOptions{RemoteName: defaultRemote, ClientOptions: b.clientOpts})
-	if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
-		b.setLastError(fmt.Errorf("fetch: %w", err))
-		return fmt.Errorf("fetch: %w", err)
+	// Local err vars: the deferred recorder reads the *returned* error, so an
+	// up-to-date fetch/pull must not leak into it.
+	if ferr := b.remoteOp(ctx, "git.fetch", func(ctx context.Context) error {
+		return b.repo.FetchContext(ctx, &git.FetchOptions{RemoteName: defaultRemote, ClientOptions: b.clientOpts})
+	}); ferr != nil && !errors.Is(ferr, git.NoErrAlreadyUpToDate) {
+		b.setLastError(fmt.Errorf("fetch: %w", ferr))
+		return fmt.Errorf("fetch: %w", ferr)
 	}
 	b.stateMu.Lock()
 	b.state.LastFetch = time.Now().UTC().Format(time.RFC3339)
 	b.stateMu.Unlock()
 
 	state := b.refreshState()
+	span.SetAttributes(attrGitState.String(state))
 	if state != "behind" {
 		// in-sync: nothing to do; dirty/ahead/diverged: hands off — pulling
 		// would need a merge, and merges are a human decision here.
+		if state == "in-sync" {
+			result = "up-to-date"
+		}
 		return nil
 	}
 
-	err = b.wt.PullContext(ctx, &git.PullOptions{
-		RemoteName:    defaultRemote,
-		ReferenceName: plumbing.NewBranchReferenceName(b.cfg.GitBranch),
-		ClientOptions: b.clientOpts,
-	})
-	if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
-		b.setLastError(fmt.Errorf("pull: %w", err))
-		return fmt.Errorf("pull: %w", err)
+	if perr := b.remoteOp(ctx, "git.pull", func(ctx context.Context) error {
+		return b.wt.PullContext(ctx, &git.PullOptions{
+			RemoteName:    defaultRemote,
+			ReferenceName: plumbing.NewBranchReferenceName(b.cfg.GitBranch),
+			ClientOptions: b.clientOpts,
+		})
+	}); perr != nil && !errors.Is(perr, git.NoErrAlreadyUpToDate) {
+		b.setLastError(fmt.Errorf("pull: %w", perr))
+		return fmt.Errorf("pull: %w", perr)
 	}
 
 	b.stateMu.Lock()
 	b.state.LastPull = time.Now().UTC().Format(time.RFC3339)
 	b.stateMu.Unlock()
 	b.refreshState()
+	result = "pulled"
 	b.logger.Info("pulled remote changes")
 	return nil
 }
@@ -614,6 +737,7 @@ func restoreGit(ctx context.Context, logger *slog.Logger, cfg envConfig) error {
 		return err
 	}
 	state := b.refreshState()
+	trace.SpanFromContext(ctx).SetAttributes(attrGitState.String(state))
 	logger.Info("restore complete", "state", state)
 	return nil
 }

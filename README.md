@@ -116,6 +116,61 @@ The token is passed in-process per request (pure-Go git via
 [go-git](https://github.com/go-git/go-git)) — it is never written to
 `.git/config` or disk. Ignore rules come from the repo's own `.gitignore`.
 
+## Observability
+
+The sidecar emits OpenTelemetry traces and metrics over **OTLP/HTTP**.
+Export is off unless an endpoint is configured, so the defaults run fine
+without a collector:
+
+| Variable                       | Default        | Description                                          |
+|--------------------------------|----------------|------------------------------------------------------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT`  | (unset = off)  | Collector base URL, e.g. `http://otel-collector:4318` |
+| `OTEL_SERVICE_NAME`            | `snapshot-sidecar` | Reported `service.name`                          |
+| `OTEL_RESOURCE_ATTRIBUTES`     | *(empty)*      | Extra resource attributes, e.g. `box.id=abc,env=prod` |
+| `OTEL_SDK_DISABLED`            | `false`        | `true` forces export off even with an endpoint set   |
+
+The signal-specific `OTEL_EXPORTER_OTLP_{TRACES,METRICS}_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_HEADERS` and the other standard OTLP variables are honoured
+too — setting any endpoint variable turns export on. `service.version` is the
+build's VCS stamp (same string as `snapshot-sidecar version`).
+
+**Traces.** One span per operation, with the remote round-trips as children:
+
+```
+snapshot.v1.SnapshotService/TriggerSnapshot   (RPC, from the caller's trace)
+└── snapshot.save        snapshot.backend, snapshot.trigger, snapshot.status, snapshot.key/hash
+    └── git.push         git.branch, git.up_to_date | git.non_fast_forward
+                         event: "push rejected: non-fast-forward, commit kept local"
+snapshot.sync            snapshot.sync.result, snapshot.git.state
+├── git.fetch
+└── git.pull
+snapshot.restore         snapshot.backend  (init container; git.adopt / snapshot.extract below)
+```
+
+`snapshot.trigger` says who asked: `rpc`, `autosave`, `shutdown` or `restore` —
+so the SIGTERM save is distinguishable from a Console Save. An incoming
+`traceparent` is trusted and becomes the parent span, so a save shows up inside
+the caller's trace. Outcomes that are normal but interesting (dedup hit, busy
+skip, non-fast-forward push, empty remote, first boot with no snapshot) are span
+events, not errors — only real failures set the span's error status.
+
+**Metrics.**
+
+| Metric                     | Type      | Attributes                                    |
+|----------------------------|-----------|-----------------------------------------------|
+| `snapshot.save.duration`   | histogram | `snapshot.backend`, `snapshot.status`, `error.type` |
+| `snapshot.sync.duration`   | histogram | `snapshot.sync.result`, `error.type`          |
+| `snapshot.restore.duration`| histogram | `snapshot.backend`, `error.type`              |
+| `snapshot.archive.size`    | histogram | `snapshot.backend` (s3)                       |
+| `snapshot.archive.files`   | histogram | `snapshot.backend` (s3)                       |
+| `snapshot.git.state`       | gauge     | `snapshot.git.state` (1 for the current state, 0 for the others) |
+
+`error.type` is only attached on failure. The histograms' counts carry the
+rates — e.g. `snapshot.save.duration` by `snapshot.status` gives created vs
+unchanged vs `remote_changed`, and `snapshot.git.state{snapshot.git.state="diverged"} == 1`
+is the alert that a box needs a human. The ConnectRPC handler also emits the
+standard `rpc.server.*` metrics and spans.
+
 ## API
 
 The sidecar exposes a ConnectRPC service (compatible with gRPC, gRPC-Web, and

@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -245,10 +246,8 @@ func (s *snapshotter) tarProjectDir(ctx context.Context) (_ []byte, _ string, er
 		}
 
 		if d.IsDir() {
-			for _, excl := range s.cfg.ExcludeDirs {
-				if rel == excl {
-					return filepath.SkipDir
-				}
+			if slices.Contains(s.cfg.ExcludeDirs, rel) {
+				return filepath.SkipDir
 			}
 		}
 

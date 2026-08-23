@@ -99,21 +99,22 @@ func buildVersion() string {
 		return "unknown"
 	}
 
-	version := info.Main.Version
+	var version strings.Builder
+	version.WriteString(info.Main.Version)
 	for _, s := range info.Settings {
 		switch s.Key {
 		case "vcs.revision":
-			version += " " + shortHash(s.Value)
+			version.WriteString(" " + shortHash(s.Value))
 		case "vcs.time":
-			version += " " + s.Value
+			version.WriteString(" " + s.Value)
 		case "vcs.modified":
 			if s.Value == "true" {
-				version += " (dirty)"
+				version.WriteString(" (dirty)")
 			}
 		}
 	}
 
-	return version
+	return version.String()
 }
 
 // envConfig reads configuration from environment variables.
@@ -172,7 +173,7 @@ func loadConfig() (envConfig, error) {
 	}
 
 	if v := os.Getenv("SNAPSHOT_EXCLUDE_DIRS"); v != "" {
-		for _, d := range strings.Split(v, ",") {
+		for d := range strings.SplitSeq(v, ",") {
 			d = strings.TrimSpace(d)
 			if d != "" {
 				c.ExcludeDirs = append(c.ExcludeDirs, d)
@@ -303,22 +304,18 @@ func runServe(logger *slog.Logger) error {
 
 	// Optional periodic auto-save.
 	if cfg.AutosaveInterval > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			autosaveLoop(ctx, logger, b, cfg.AutosaveInterval)
-		}()
+		})
 	}
 
 	// Optional periodic remote sync (git backend only).
 	if s, ok := b.(interface {
 		syncLoop(context.Context, time.Duration)
 	}); ok && cfg.SyncInterval > 0 {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			s.syncLoop(ctx, cfg.SyncInterval)
-		}()
+		})
 	}
 
 	// Wait for signal or error.

@@ -1,0 +1,25 @@
+# golangci-lint configuration. Run it locally with `golangci-lint run`; CI runs
+# exactly the same. Until the Go 1.27 bump this repo had no config at all and
+# CI linted under the built-in defaults — which meant the gofumpt drift below
+# was invisible, because gofumpt is not part of any default set.
+version: "2"
+
+linters:
+  # The standard set: errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  exclusions:
+    # `std-error-handling` drops the idiomatic "unchecked error" noise from
+    # deferred Close/Flush, os.Remove*, and fmt.Fprint*/Print* calls — errors
+    # there are conventionally ignored. Everything else stays enforced. Same
+    # preset as workspace-api.
+    presets:
+      - std-error-handling
+
+# gofumpt, newly enforced with the Go 1.27 bump. Declaring it here makes
+# `golangci-lint run` — and therefore CI — the thing that catches formatting,
+# which also means a golangci-lint bump that adds a gofumpt rule fails the lint
+# job instead of showing up as mystery diff in an unrelated PR. That is why the
+# action's version is pinned. Run `golangci-lint fmt` to apply.
+formatters:
+  enable:
+    - gofumpt

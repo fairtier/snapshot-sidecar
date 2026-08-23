@@ -1,7 +1,11 @@
 ############################
 # STEP 0 build arguments
 ############################
-ARG GO_VERSION=1.26
+# Minor version on purpose, not a full patch pin: this repo has no Dependabot
+# and the image is only rebuilt on a release tag, so `1.27` resolves to the
+# newest 1.27.x at build time rather than to whatever was current when someone
+# last edited this line. Move it with the `go` directive in go.mod.
+ARG GO_VERSION=1.27
 ARG BASE_VARIANT=trixie
 
 ############################

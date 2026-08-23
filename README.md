@@ -50,7 +50,7 @@ upload, the upload is skipped. This makes frequent auto-save intervals cheap.
 
 ### Prerequisites
 
-- Go 1.26+
+- Go 1.27+
 - S3-compatible storage with a bucket
 
 ### Build

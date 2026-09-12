@@ -6,7 +6,7 @@ require (
 	connectrpc.com/connect v1.20.0
 	connectrpc.com/grpchealth v1.5.0
 	connectrpc.com/otelconnect v0.9.0
-	github.com/aws/aws-sdk-go-v2 v1.43.7
+	github.com/aws/aws-sdk-go-v2 v1.47.0
 	github.com/aws/aws-sdk-go-v2/config v1.32.38
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.107.3
 	github.com/go-git/go-git/v6 v6.0.0-alpha.5
@@ -37,7 +37,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.33.7 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.38.7 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.45.7 // indirect
-	github.com/aws/smithy-go v1.27.9 // indirect
+	github.com/aws/smithy-go v1.28.1 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/cloudflare/circl v1.6.5 // indirect

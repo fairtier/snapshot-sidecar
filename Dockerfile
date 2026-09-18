@@ -1,17 +1,22 @@
 ############################
 # STEP 0 build arguments
 ############################
-# Minor version on purpose, not a full patch pin: this repo has no Dependabot
-# and the image is only rebuilt on a release tag, so `1.27` resolves to the
-# newest 1.27.x at build time rather than to whatever was current when someone
-# last edited this line. Move it with the `go` directive in go.mod.
+# Minor version on purpose, not a full patch pin: the image is only rebuilt on
+# a release tag, so `1.27` resolves to the newest 1.27.x at build time rather
+# than to whatever was current when someone last edited this line. Dependabot
+# does not resolve an ARG-interpolated FROM, so move it by hand, with the `go`
+# directive in go.mod.
 ARG GO_VERSION=1.27
 ARG BASE_VARIANT=trixie
 
 ############################
 # STEP 1 build the binary
 ############################
-FROM golang:${GO_VERSION}-${BASE_VARIANT} AS builder
+# Pinned to the BUILD platform, not the target: CGO is off and the build below
+# sets GOARCH explicitly, so Go cross-compiles the arm64 binary natively on the
+# amd64 runner. Without this, buildx runs this whole stage under QEMU for the
+# arm64 leg and the release takes ~10 minutes instead of ~2.
+FROM --platform=$BUILDPLATFORM golang:${GO_VERSION}-${BASE_VARIANT} AS builder
 
 WORKDIR /app
 

@@ -6,7 +6,7 @@ require (
 	connectrpc.com/connect v1.21.0
 	connectrpc.com/grpchealth v1.5.0
 	connectrpc.com/otelconnect v0.9.0
-	github.com/aws/aws-sdk-go-v2 v1.47.0
+	github.com/aws/aws-sdk-go-v2 v1.47.1
 	github.com/aws/aws-sdk-go-v2/config v1.33.5
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.113.1
 	github.com/go-git/go-git/v6 v6.0.0-alpha.5

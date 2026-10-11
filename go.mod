@@ -5,7 +5,7 @@ go 1.27.0
 require (
 	connectrpc.com/connect v1.21.0
 	connectrpc.com/grpchealth v1.5.0
-	connectrpc.com/otelconnect v0.9.0
+	connectrpc.com/otelconnect v0.11.0
 	github.com/aws/aws-sdk-go-v2 v1.47.0
 	github.com/aws/aws-sdk-go-v2/config v1.33.5
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.113.1
@@ -21,6 +21,7 @@ require (
 )
 
 require (
+	connectrpc.com/connect/v2 v2.0.0 // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/ProtonMail/go-crypto v1.4.1 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.20 // indirect
